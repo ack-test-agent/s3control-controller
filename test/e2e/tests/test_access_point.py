@@ -34,6 +34,28 @@ CREATE_WAIT_AFTER_SECONDS = 10
 UPDATE_WAIT_AFTER_SECONDS = 10
 DELETE_WAIT_AFTER_SECONDS = 10
 
+# Tags set on create by the accesspoint_with_tags.yaml template.
+TAG_KEY_1 = "environment"
+TAG_VALUE_1 = "test"
+TAG_KEY_2 = "purpose"
+TAG_VALUE_2 = "ack-e2e"
+
+
+def _cr_arn(ref) -> str:
+    """Return the access point ARN recorded on the CR's status."""
+    cr = k8s.get_resource(ref)
+    assert cr is not None
+    arn = cr["status"]["ackResourceMetadata"]["arn"]
+    assert arn is not None
+    return arn
+
+
+def _cr_tags(ref) -> dict:
+    """Return the CR's spec.tags as a {key: value} dict."""
+    cr = k8s.get_resource(ref)
+    assert cr is not None
+    return {t["key"]: t["value"] for t in cr["spec"].get("tags") or []}
+
 @pytest.fixture(scope="module")
 def simple_access_point(s3control_client):
 
@@ -182,6 +204,53 @@ def access_point_no_policy(s3control_client):
     assert not validator.access_point_exist(account_id, resource_name)
 
 
+@pytest.fixture(scope="module")
+def access_point_with_tags(s3control_client):
+    resource_name = random_suffix_name("ap-tags", 24)
+    account_id = get_account_id()
+
+    replacements = REPLACEMENT_VALUES.copy()
+    replacements["ACCESS_POINT_NAME"] = resource_name
+    replacements["ACCOUNT_ID"] = account_id
+    replacements["BUCKET_NAME"] = get_bootstrap_resources().Bucket.name
+    replacements["TAG_KEY_1"] = TAG_KEY_1
+    replacements["TAG_VALUE_1"] = TAG_VALUE_1
+    replacements["TAG_KEY_2"] = TAG_KEY_2
+    replacements["TAG_VALUE_2"] = TAG_VALUE_2
+
+    resource_data = load_s3control_resource(
+        "accesspoint_with_tags",
+        additional_replacements=replacements,
+    )
+
+    logging.debug(resource_data)
+
+    ref = k8s.CustomResourceReference(
+        CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL,
+        resource_name, namespace="default",
+    )
+    k8s.create_custom_resource(ref, resource_data)
+
+    time.sleep(CREATE_WAIT_AFTER_SECONDS)
+    cr = k8s.wait_resource_consumed_by_controller(ref)
+
+    assert cr is not None
+    assert k8s.get_resource_exists(ref)
+
+    yield (ref, cr, resource_name)
+
+    _, deleted = k8s.delete_custom_resource(
+        ref,
+        period_length=DELETE_WAIT_AFTER_SECONDS,
+    )
+    assert deleted
+
+    time.sleep(DELETE_WAIT_AFTER_SECONDS)
+
+    validator = S3ControlValidator(s3control_client)
+    assert not validator.access_point_exist(account_id, resource_name)
+
+
 @service_marker
 @pytest.mark.canary
 class TestAccessPoint:
@@ -242,3 +311,81 @@ class TestAccessPoint:
 
         aws_policy = validator.get_access_point_policy(account_id, resource_name)
         assert aws_policy is None, "Expected policy to be removed after patch"
+
+    def test_create_with_tags(self, s3control_client, access_point_with_tags):
+        """Tags supplied on create must reach AWS and be readable back on the CR."""
+        (ref, _, resource_name) = access_point_with_tags
+        account_id = get_account_id()
+
+        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=5)
+
+        validator = S3ControlValidator(s3control_client)
+        assert validator.access_point_exist(account_id, resource_name)
+
+        # --- AWS-side verification
+        aws_tags = validator.get_tags_dict(account_id, _cr_arn(ref))
+        assert aws_tags is not None, "Expected ListTagsForResource to succeed"
+        # Subset assertion only: ACK's MergeResourceTags injects its own
+        # services.k8s.aws/* default tags, so exact equality would fail.
+        assert aws_tags.get(TAG_KEY_1) == TAG_VALUE_1
+        assert aws_tags.get(TAG_KEY_2) == TAG_VALUE_2
+
+        # --- CR-side verification. This is the regression guard for the
+        # update-loop failure mode: if the ReadOne tag hook did not populate
+        # latest.Spec.Tags, the delta would never converge.
+        cr_tags = _cr_tags(ref)
+        assert cr_tags.get(TAG_KEY_1) == TAG_VALUE_1
+        assert cr_tags.get(TAG_KEY_2) == TAG_VALUE_2
+
+    def test_update_tags(self, s3control_client, access_point_with_tags):
+        """Add, change and remove tags on an existing access point.
+
+        Exercises both TagResource (add/change) and UntagResource (remove).
+        """
+        (ref, _, resource_name) = access_point_with_tags
+        account_id = get_account_id()
+
+        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=5)
+
+        validator = S3ControlValidator(s3control_client)
+        arn = _cr_arn(ref)
+
+        new_key = "owner"
+        new_value = "ack"
+        updated_value = TAG_VALUE_1 + "-updated"
+
+        # Change TAG_KEY_1's value, drop TAG_KEY_2, add a brand new key.
+        patch = {
+            "spec": {
+                "tags": [
+                    {"key": TAG_KEY_1, "value": updated_value},
+                    {"key": new_key, "value": new_value},
+                ]
+            }
+        }
+        k8s.patch_custom_resource(ref, patch)
+        time.sleep(UPDATE_WAIT_AFTER_SECONDS)
+
+        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=10)
+
+        # --- AWS-side verification
+        aws_tags = validator.get_tags_dict(account_id, arn)
+        assert aws_tags is not None
+        assert aws_tags.get(TAG_KEY_1) == updated_value, "changed tag should be updated"
+        assert aws_tags.get(new_key) == new_value, "added tag should be present"
+        assert TAG_KEY_2 not in aws_tags, "removed tag key should be gone from AWS"
+
+        # --- CR-side verification
+        cr_tags = _cr_tags(ref)
+        assert cr_tags.get(TAG_KEY_1) == updated_value
+        assert cr_tags.get(new_key) == new_value
+        assert TAG_KEY_2 not in cr_tags
+
+        # --- No-drift check: the resource must settle rather than flap between
+        # Synced=True/False on subsequent reconciles.
+        time.sleep(UPDATE_WAIT_AFTER_SECONDS)
+        assert k8s.wait_on_condition(ref, "ACK.ResourceSynced", "True", wait_periods=5)
+        settled_tags = _cr_tags(ref)
+        assert settled_tags.get(TAG_KEY_1) == updated_value
+        assert settled_tags.get(new_key) == new_value
+        assert TAG_KEY_2 not in settled_tags

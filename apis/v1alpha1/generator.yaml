@@ -1,4 +1,20 @@
 ignore:
+  field_paths:
+    # Scope-containment for the SDK model bump that brings in
+    # CreateAccessPoint's Tags member. These members arrived in the same model
+    # range but are out of scope for the tags field addition:
+    #   - Scope is directory-bucket-only and needs its own design.
+    #   - DataSourceId/DataSourceType are unrelated read-only additions.
+    # NOTE: shape paths use the aws-sdk-go model loader's normalised operation
+    # shape names (<Op>Input / <Op>Output), not the Smithy names
+    # (<Op>Request / <Op>Result) -- createInputOutputShapes() renames them.
+    - CreateAccessPointInput.Scope
+    - GetAccessPointOutput.DataSourceId
+    - GetAccessPointOutput.DataSourceType
+    # The AccessPoint shape (surfaced as the AccessPoint_SDK type def) carries
+    # its own copies of the same two new members.
+    - AccessPoint.DataSourceId
+    - AccessPoint.DataSourceType
   resource_names:
     - AccessGrant
     - AccessGrantsInstance
@@ -15,8 +31,6 @@ resources:
       errors:
         404:
           code: NoSuchAccessPoint
-    tags:
-      ignore: true
     fields:
       # NOTE: Spec.Bucket is deliberately NOT reference-backed. It is polymorphic:
       # for a general purpose bucket it holds the bucket NAME, and for an S3 on

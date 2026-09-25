@@ -44,3 +44,27 @@ class S3ControlValidator:
         except Exception:
             return None
 
+    def list_tags_for_resource(self, account_id: str, resource_arn: str):
+        """Return the access point's tags as a list of {'Key':..,'Value':..}.
+
+        GetAccessPoint does not return tags; they live behind the separate
+        ListTagsForResource API, which is addressed by ARN rather than name.
+        Returns None if the call fails (e.g. the access point is gone).
+        """
+        try:
+            resp = self.s3control_client.list_tags_for_resource(
+                AccountId=account_id,
+                ResourceArn=resource_arn,
+            )
+            return resp.get('Tags', [])
+        except Exception as e:
+            logging.debug(f"list_tags_for_resource failed: {e}")
+            return None
+
+    def get_tags_dict(self, account_id: str, resource_arn: str):
+        """Same as list_tags_for_resource but keyed by tag key for easy asserts."""
+        tags = self.list_tags_for_resource(account_id, resource_arn)
+        if tags is None:
+            return None
+        return {t['Key']: t['Value'] for t in tags}
+
