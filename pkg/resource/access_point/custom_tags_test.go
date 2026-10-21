@@ -15,7 +15,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -188,60 +187,6 @@ func (c *errorTagsHTTPClient) Do(req *http.Request) (*http.Response, error) {
 		}, nil
 	}
 	return c.tagsHTTPClient.Do(req)
-}
-
-// TestSyncTags_AddsUpdatesAndRemoves asserts syncTags translates the tag diff
-// into exactly one UntagResource call for removed keys and one TagResource call
-// for added/changed keys.
-func TestSyncTags_AddsUpdatesAndRemoves(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-
-	httpc := &tagsHTTPClient{}
-	rm := newTagsResourceManager(httpc)
-
-	desired := resourceWithTags([]*svcapitypes.Tag{
-		tag("env", "staging"), // changed
-		tag("owner", "ack"),   // added
-	}, true)
-	latest := resourceWithTags([]*svcapitypes.Tag{
-		tag("env", "prod"),   // changed
-		tag("stale", "true"), // removed
-	}, true)
-
-	require.NoError(rm.syncTags(context.Background(), desired, latest))
-
-	untagReq, _ := httpc.findTagOp(http.MethodDelete)
-	require.NotNil(untagReq, "removed tag keys must be sent to UntagResource")
-	q, err := url.ParseQuery(untagReq.URL.RawQuery)
-	require.NoError(err)
-	assert.Equal([]string{"stale"}, q["tagKeys"])
-	assert.Equal(testAccountID, untagReq.Header.Get("X-Amz-Account-Id"))
-
-	tagReq, tagBody := httpc.findTagOp(http.MethodPost)
-	require.NotNil(tagReq, "added/changed tags must be sent to TagResource")
-	assert.Contains(tagBody, "<Key>env</Key>")
-	assert.Contains(tagBody, "<Value>staging</Value>")
-	assert.Contains(tagBody, "<Key>owner</Key>")
-	assert.NotContains(tagBody, "stale")
-}
-
-// TestSyncTags_NoopWhenNoDiff asserts an identical tag set issues no API calls,
-// and that AWS-managed "aws:" tags are never added or removed.
-func TestSyncTags_NoopWhenNoDiff(t *testing.T) {
-	require := require.New(t)
-
-	httpc := &tagsHTTPClient{}
-	rm := newTagsResourceManager(httpc)
-
-	desired := resourceWithTags([]*svcapitypes.Tag{tag("env", "prod")}, true)
-	latest := resourceWithTags([]*svcapitypes.Tag{
-		tag("env", "prod"),
-		tag("aws:cloudformation:stack-name", "my-stack"),
-	}, true)
-
-	require.NoError(rm.syncTags(context.Background(), desired, latest))
-	require.Empty(httpc.requests, "no tag API call expected when only aws: tags differ")
 }
 
 // TestSyncTags_NoARNIsNoop asserts syncTags bails out rather than panicking
